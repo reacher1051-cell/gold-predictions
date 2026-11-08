@@ -22,6 +22,7 @@ import json
 import os
 import re
 import subprocess
+import urllib.parse
 import sys
 from datetime import datetime, timedelta, timezone
 
@@ -133,29 +134,53 @@ def find_direction(text):
 
 # -------------------------------------------------------------- instagram --
 def get_loader():
+    """Instagram session banao: sirf sessionid cookie se login aksar adhoora
+    rehta hai - Instaloader ke GraphQL sawalon ko csrftoken + ds_user_id bhi
+    chahiye. Is liye pehle homepage khol kar server se baqi cookies lo."""
+    import requests
     import instaloader
     L = instaloader.Instaloader(download_pictures=False, download_videos=False,
                                 download_video_thumbnails=False,
                                 save_metadata=False, compress_json=False,
                                 quiet=True)
-    sessionid = os.environ.get("IG_SESSIONID", "").strip()
+    raw = os.environ.get("IG_SESSIONID", "").strip()
+    if not raw:
+        raise RuntimeError("IG_SESSIONID secret khali hai - repo Secrets mein dalo.")
+    sessionid = raw
+    for _ in range(2):  # cookies mein value kabhi do-degree encoded hoti hai
+        dec = urllib.parse.unquote(sessionid)
+        if dec == sessionid:
+            break
+        sessionid = dec
+    sess = L.context._session
+    sess.cookies.set("sessionid", sessionid, domain=".instagram.com")
+    # ds_user_id sessionid ke pehle hisse mein hota hai (userid:... wali shakal)
+    m = re.match(r"(\d+)", sessionid)
+    if m:
+        sess.cookies.set("ds_user_id", m.group(1), domain=".instagram.com")
+        log("ds_user_id mila:", m.group(1))
+    # Homepage se csrftoken / mid cookies lo
+    try:
+        sess.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                         "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                         "Chrome/126.0.0.0 Safari/537.36"})
+        sess.get("https://www.instagram.com/", timeout=30)
+    except Exception as e:
+        log("homepage cookie fetch fail:", e)
+    who = L.test_login()
+    if who:
+        log("Instagram login OK:", who)
+        return L
+    # Aakhri koshish: password wala rasta agar secrets diye hon
     username = os.environ.get("IG_USERNAME", "").strip()
     password = os.environ.get("IG_PASSWORD", "").strip()
-    if sessionid:
-        L.context._session.cookies.set("sessionid", sessionid, domain=".instagram.com")
-        if username:
-            L.context._session.cookies.set("ds_user_id", username, domain=".instagram.com")
-        who = L.test_login()
-        if not who:
-            raise RuntimeError("IG_SESSIONID se login nahi hua - session expire ho gayi lagti hai. "
-                               "Nayi sessionid secret mein dalni paregi.")
-        log("Instagram login OK (session):", who)
-    elif username and password:
-        L.login(username, password)
+    if username and password:
+        L2 = instaloader.Instaloader(quiet=True)
+        L2.login(username, password)
         log("Instagram login OK (password):", username)
-    else:
-        raise RuntimeError("Koi login nahi mila: repo Secrets mein IG_SESSIONID lazmi hai.")
-    return L
+        return L2
+    raise RuntimeError("Login nahi hua: ya sessionid ghalat/expire hai, ya Instagram ne "
+                       "GitHub ke server ko roka hai. Log ki pehli lines dekho.")
 
 
 def transcribe(video_url, shortcode):
