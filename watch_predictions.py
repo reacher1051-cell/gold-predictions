@@ -133,54 +133,128 @@ def find_direction(text):
 
 
 # -------------------------------------------------------------- instagram --
-def get_loader():
-    """Instagram session banao: sirf sessionid cookie se login aksar adhoora
-    rehta hai - Instaloader ke GraphQL sawalon ko csrftoken + ds_user_id bhi
-    chahiye. Is liye pehle homepage khol kar server se baqi cookies lo."""
+def web_session():
+    """Seedha Instagram ki website-wali API ke liye session: sessionid cookie
+    decode karke, poori cookie set ke sath, homepage se csrftoken le kar."""
     import requests
+    raw = os.environ.get("IG_SESSIONID", "").strip()
+    if not raw:
+        raise RuntimeError("IG_SESSIONID secret khali hai - repo Secrets mein dalo.")
+    sessionid = raw
+    for _ in range(2):  # cookie value kabhi do-degree URL-encoded hoti hai
+        dec = urllib.parse.unquote(sessionid)
+        if dec == sessionid:
+            break
+        sessionid = dec
+    sess = requests.Session()
+    sess.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/126.0.0.0 Safari/537.36",
+        "X-IG-App-ID": "936619743392459",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    sess.cookies.set("sessionid", sessionid, domain=".instagram.com")
+    m = re.match(r"(\d+)", sessionid)  # sessionid ki shakal: userid:...
+    if m:
+        sess.cookies.set("ds_user_id", m.group(1), domain=".instagram.com")
+        log("ds_user_id mila")
+    try:
+        r = sess.get("https://www.instagram.com/", timeout=30)
+        log("homepage status:", r.status_code,
+            "| csrftoken mila:", bool(sess.cookies.get("csrftoken")))
+    except Exception as e:
+        log("homepage fail:", e)
+    csrf = sess.cookies.get("csrftoken")
+    if csrf:
+        sess.headers.update({"X-CSRFToken": csrf})
+    return sess
+
+
+def fetch_posts_web(sess):
+    """Web API se target ki taaza posts: list of dict(shortcode, date, caption,
+    video_url). Login fail ho to saaf error."""
+    import requests
+    base = "https://www.instagram.com/api/v1"
+    r = sess.get(f"{base}/users/web_profile_info/",
+                 params={"username": TARGET_USERNAME}, timeout=30)
+    log("profile status:", r.status_code)
+    if r.status_code != 200:
+        raise RuntimeError(f"Web API ne profile nahi di (status {r.status_code}) - "
+                           "sessionid ghalat/expire hai ya Instagram ne GitHub "
+                           "server ko roka hai.")
+    try:
+        user = r.json()["data"]["user"]
+    except Exception:
+        raise RuntimeError("Profile ka jawab samajh nahi aya (JSON nahi mila).")
+    uid = user["id"]
+    log("profile OK:", user.get("username"), "| id:", uid)
+    r = sess.get(f"{base}/feed/user/{uid}/", params={"count": 12}, timeout=30)
+    log("feed status:", r.status_code)
+    if r.status_code != 200:
+        raise RuntimeError(f"Feed nahi mili (status {r.status_code}).")
+    items = r.json().get("items", [])
+    posts = []
+    for it in items:
+        cap = ((it.get("caption") or {}).get("text")) or ""
+        vurl = None
+        vv = it.get("video_versions") or []
+        if vv:
+            vurl = max(vv, key=lambda v: v.get("height", 0)).get("url")
+        posts.append({
+            "shortcode": it.get("code"),
+            "date": datetime.fromtimestamp(it.get("taken_at", 0),
+                                           tz=timezone.utc).date(),
+            "caption": cap,
+            "video_url": vurl,
+        })
+    log("posts mili:", len(posts))
+    return posts
+
+
+def fetch_posts_instaloader():
+    """Purana rasta (backup): Instaloader GraphQL login."""
     import instaloader
     L = instaloader.Instaloader(download_pictures=False, download_videos=False,
                                 download_video_thumbnails=False,
                                 save_metadata=False, compress_json=False,
                                 quiet=True)
     raw = os.environ.get("IG_SESSIONID", "").strip()
-    if not raw:
-        raise RuntimeError("IG_SESSIONID secret khali hai - repo Secrets mein dalo.")
     sessionid = raw
-    for _ in range(2):  # cookies mein value kabhi do-degree encoded hoti hai
+    for _ in range(2):
         dec = urllib.parse.unquote(sessionid)
         if dec == sessionid:
             break
         sessionid = dec
     sess = L.context._session
     sess.cookies.set("sessionid", sessionid, domain=".instagram.com")
-    # ds_user_id sessionid ke pehle hisse mein hota hai (userid:... wali shakal)
     m = re.match(r"(\d+)", sessionid)
     if m:
         sess.cookies.set("ds_user_id", m.group(1), domain=".instagram.com")
-        log("ds_user_id mila:", m.group(1))
-    # Homepage se csrftoken / mid cookies lo
-    try:
-        sess.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                         "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                         "Chrome/126.0.0.0 Safari/537.36"})
-        sess.get("https://www.instagram.com/", timeout=30)
-    except Exception as e:
-        log("homepage cookie fetch fail:", e)
     who = L.test_login()
-    if who:
-        log("Instagram login OK:", who)
-        return L
-    # Aakhri koshish: password wala rasta agar secrets diye hon
-    username = os.environ.get("IG_USERNAME", "").strip()
-    password = os.environ.get("IG_PASSWORD", "").strip()
-    if username and password:
-        L2 = instaloader.Instaloader(quiet=True)
-        L2.login(username, password)
-        log("Instagram login OK (password):", username)
-        return L2
-    raise RuntimeError("Login nahi hua: ya sessionid ghalat/expire hai, ya Instagram ne "
-                       "GitHub ke server ko roka hai. Log ki pehli lines dekho.")
+    if not who:
+        raise RuntimeError("Instaloader login bhi fail.")
+    log("Instaloader login OK:", who)
+    profile = instaloader.Profile.from_username(L.context, TARGET_USERNAME)
+    posts = []
+    for post in profile.get_posts():
+        posts.append({"shortcode": post.shortcode,
+                      "date": post.date_utc.date(),
+                      "caption": post.caption or "",
+                      "video_url": post.video_url if post.is_video else None})
+        if len(posts) >= MAX_POSTS_TO_CHECK:
+            break
+    return posts
+
+
+def fetch_posts():
+    """Pehle web API, fail ho to Instaloader - dono ki koshish ke baad error."""
+    sess = web_session()
+    try:
+        return fetch_posts_web(sess)
+    except Exception as e:
+        log("web API fail:", e, "-> Instaloader wala rasta try kar raha hun")
+    return fetch_posts_instaloader()
 
 
 def transcribe(video_url, shortcode):
@@ -216,28 +290,26 @@ def main():
     if os.path.exists(PRED_FILE):
         preds = json.load(open(PRED_FILE))
 
-    L = get_loader()
-    import instaloader
-    profile = instaloader.Profile.from_username(L.context, TARGET_USERNAME)
+    posts = fetch_posts()
     now = datetime.now(timezone.utc)
     changed = False
     checked = 0
 
-    for post in profile.get_posts():
+    for post in posts:
         if checked >= MAX_POSTS_TO_CHECK:
             break
-        post_date = post.date_utc.date()
+        post_date = post["date"]
         if (now.date() - post_date).days > MAX_POST_AGE_DAYS:
             continue
         checked += 1
-        code = post.shortcode
-        if code in seen["shortcodes"]:
+        code = post["shortcode"]
+        if not code or code in seen["shortcodes"]:
             continue
-        if not post.is_video:
+        if not post["video_url"]:
             seen["shortcodes"].append(code)
             changed = True
             continue
-        caption = post.caption or ""
+        caption = post["caption"] or ""
         codes_hint = find_event_codes(caption)
         if not codes_hint:
             log("skip (news wali reel nahi):", code)
@@ -245,7 +317,7 @@ def main():
             changed = True
             continue
 
-        speech = transcribe(post.video_url, code) if post.video_url else ""
+        speech = transcribe(post["video_url"], code) if post["video_url"] else ""
         full = caption + " " + speech
         codes = codes_hint or find_event_codes(full)
         date_str = find_event_date(full, post_date)
